@@ -1,0 +1,16 @@
+# Installation:
+#   1. Install PyTorch separately (see below)
+#   2. Run: pip install -r requirements.txt
+#
+# Python 3.11.13 (current - installed separately)
+# PyTorch - Install separately based on your needs:
+#   GPU (CUDA): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#   CPU only:   pip install torch torchvision torchaudio
+#   See https://pytorch.org/get-started/locally/ for details
+python-dotenv
+numpy
+tiktoken
+matplotlib
+transformers
+thop
+tqdm
