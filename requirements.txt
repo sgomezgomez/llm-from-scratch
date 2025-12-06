@@ -14,3 +14,4 @@ matplotlib
 transformers
 thop
 tqdm
+langdetect

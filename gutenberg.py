@@ -7,10 +7,23 @@ Script that processes the Project Gutenberg files into fewer larger files.
 import argparse, os, re
 from tqdm import tqdm
 from data.gutenberg.src.cleanup import strip_headers
+from langdetect import detect, DetectorFactory, LangDetectException
 
-def is_english(text, threshold=0.9):
-    ascii_chars = sum(1 for c in text if ord(c) < 128)
-    return ascii_chars / len(text) > threshold
+# Langdetect -- Google's language detection algorithm
+# Uses statistical models with some randomness. Setting a seed makes each detect() call
+# deterministic for a given text input, ensuring reproducible results regardless of file processing order.
+DetectorFactory.seed = 0
+def is_english(text, min_length=100):
+    if not text or len(text.strip()) < min_length:
+        # Too short to reliably detect, skip it
+        return False
+    
+    try:
+        detected_lang = detect(text).lower()
+        return detected_lang == 'en'
+    except LangDetectException:
+        # If detection fails, skip the file
+        return False
 
 def combine_files(file_paths, target_dir, 
                   max_size_mb=200, 
@@ -33,9 +46,11 @@ def combine_files(file_paths, target_dir,
             with open(file_path, "r", encoding=fallback_encoding) as file:
                 content = file.read()
 
-        # if not is_english(content):
-        #     tqdm.write(f"Skipping {file_path} as it does not contain primarily English text.")
-        #     continue
+        # Check if content is English before processing
+        if not is_english(content):
+            tqdm.write(f"Skipping {file_path} as it does not contain primarily English text.")
+            continue
+        
         content = strip_headers(content)
 
         # Regular expression to replace multiple blank lines with a single blank line
