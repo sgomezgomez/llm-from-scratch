@@ -1,6 +1,8 @@
 import os
+from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
+from utils.paths import normalize_path
 
 class Config:
     """Base configuration class."""
@@ -18,17 +20,28 @@ class DataConfig(Config):
     
     def __init__(self):
         super().__init__()
-        # Read and store the environment variable once during initialization
-        self.data_dir = self.get_env_var("DATA_DIR")
-        self.plot_dir = self.data_dir + "/" + self.get_env_var("PLOT_DIR")
-        self.model_dir = self.data_dir + "/" + self.get_env_var("MODEL_DIR")
-        # Pretraining related directories
-        self.pretraining_dir = self.data_dir + "/" + self.get_env_var("PRETRAINING_DIR")
-        # Single cache directory for both index and tokenized files (organized in subdirectories)
-        self.pretraining_cache_dir = self.pretraining_dir + "/" + self.get_env_var("PRETRAINING_CACHE_DIR")
+        # Normalize base data directory (supports Windows paths under WSL)
+        base_data_dir = normalize_path(self.get_env_var("DATA_DIR"))
+        self.data_dir = str(Path(base_data_dir).expanduser())
+
+        # Derived directories
+        self.plot_dir = str(Path(self.data_dir, self.get_env_var("PLOT_DIR")))
+        self.model_dir = str(Path(self.data_dir, self.get_env_var("MODEL_DIR")))
+        self.pretraining_dir = str(Path(self.data_dir, self.get_env_var("PRETRAINING_DIR")))
+        self.pretraining_cache_dir = str(Path(self.pretraining_dir, self.get_env_var("PRETRAINING_CACHE_DIR")))
+
         # Pretraining data directories (comma-separated list in env var)
-        pretraining_data_dirs_str = self.get_env_var("PRETRAINING_DATA_DIRS", "")
-        self.pretraining_data_dirs = [os.path.join(self.pretraining_dir, d.strip()) for d in pretraining_data_dirs_str.split(",") if d.strip()]
+        pretraining_data_dirs_str = self.get_env_var("PRETRAINING_DATA_DIRS")
+        self.pretraining_data_dirs = []
+        for raw_dir in pretraining_data_dirs_str.split(","):
+            dir_str = raw_dir.strip()
+            if not dir_str:
+                continue
+            normalized = normalize_path(dir_str)
+            if os.path.isabs(normalized):
+                self.pretraining_data_dirs.append(str(Path(normalized)))
+            else:
+                self.pretraining_data_dirs.append(str(Path(self.pretraining_dir, normalized)))
     
     def get_data_path(self, filename: str) -> str:
         """Get full path to a file in the data directory."""
@@ -50,9 +63,15 @@ class TokenizerConfig(Config):
         self.custom_vocab_filename = self.get_env_var("CUSTOM_VOCAB_FILENAME")
         self.custom_merges_filename = self.get_env_var("CUSTOM_MERGES_FILENAME")
 
+class AccessConfig(Config):
+    def __init__(self):
+        super().__init__()
+        self.huggingface_api_key = self.get_env_var("HUGGINGFACE_API_KEY")
+
 # Global instance variable (initially None)
 _data_config = None
 _tokenizer_config = None
+_access_config = None
 
 def get_data_config() -> DataConfig:
     """Get the global data config instance, creating it if it doesn't exist."""
@@ -68,6 +87,14 @@ def get_tokenizer_config() -> TokenizerConfig:
         _tokenizer_config = TokenizerConfig()
     return _tokenizer_config
 
+def get_access_config() -> AccessConfig:
+    """Get the global access config instance, creating it if it doesn't exist."""
+    global _access_config
+    if _access_config is None:
+        _access_config = AccessConfig()
+    return _access_config
+
 # Create a global instance for easy access
 data_config = get_data_config()
 tokenizer_config = get_tokenizer_config()
+access_config = get_access_config()

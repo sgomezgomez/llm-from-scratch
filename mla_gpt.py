@@ -68,7 +68,6 @@ class GPTModel(nn.Module):
     
     def generate(self, idx: torch.Tensor,
                  max_tokens: int,
-                 kv_cache: bool = False,
                  temperature: float = 1.0,
                  top_k: int = None, 
                  top_p: float = None,
@@ -83,10 +82,10 @@ class GPTModel(nn.Module):
             # Generate logits for next token
             cropped_idx = idx[:, -self.cfg["context_len"]:] # (batch, context_len)
             # With KV caching, we only project the next token id after the first prediction (not the entire sequence)
-            if kv_cache and _ > 0:
+            if _ > 0:
                 cropped_idx = idx[:, -1:]
             with torch.no_grad():
-                logits = self(cropped_idx, kv_cache=kv_cache)
+                logits = self(cropped_idx, kv_cache=True)
             logits = logits[:, -1, :] # (batch, n_tokens, vocab_size) --> (batch, vocab_size)
             # Negative infinity
             neg_inf = torch.finfo(logits.dtype).min

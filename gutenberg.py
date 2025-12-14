@@ -35,6 +35,7 @@ def combine_files(file_paths, target_dir,
     current_content = []
     current_size = 0
     file_counter = 1
+    separator_bytes = separator.encode("utf-8")
 
     for file_path in tqdm(file_paths):
         try:
@@ -53,9 +54,20 @@ def combine_files(file_paths, target_dir,
         
         content = strip_headers(content)
 
-        # Regular expression to replace multiple blank lines with a single blank line
-        content = re.sub(r"\n\s*\n", "\n\n", content)
-        estimated_size = len(content.encode("utf-8"))
+        # Normalize line endings to \n only (remove \r characters)
+        # This prevents \r tokens from accumulating in the training data
+        content = content.replace('\r\n', '\n').replace('\r', '\n')
+
+        # Collapse 3+ blank lines to 2 and strip trailing whitespace via one regex pass
+        content = re.sub(
+            r'\n{3,}|[ \t]+(?=\n)',
+            lambda m: '\n\n' if m.group(0).startswith('\n') else '',
+            content,
+        )
+
+        # Encode once for both size accounting and writing
+        content_bytes = content.encode("utf-8")
+        estimated_size = len(content_bytes)
         max_size_bytes = max_size_mb * 1024 * 1024
 
         # If current file alone exceeds max size, write it as its own file (exception case)
@@ -63,28 +75,28 @@ def combine_files(file_paths, target_dir,
             # Write file as its own combined file
             tqdm.write(f"Warning: {file_path} ({estimated_size / 1024 / 1024:.2f} MB) exceeds max_size_mb ({max_size_mb} MB). Writing as standalone file.")
             target_file_path = os.path.join(target_dir, f"combined_{file_counter}.txt")
-            with open(target_file_path, "w", encoding="utf-8") as target_file:
-                target_file.write(content + separator)
+            with open(target_file_path, "wb") as target_file:
+                target_file.write(content_bytes + separator_bytes)
             file_counter += 1
         # If adding this file would exceed the limit, write out current batch first
         # This ensures files are only added if they fit fully
         elif current_content and current_size + estimated_size > max_size_bytes:
             target_file_path = os.path.join(target_dir, f"combined_{file_counter}.txt")
-            with open(target_file_path, "w", encoding="utf-8") as target_file:
-                target_file.write(separator.join(current_content) + separator)
+            with open(target_file_path, "wb") as target_file:
+                target_file.write(separator_bytes.join(current_content) + separator_bytes)
             file_counter += 1
-            current_content = [content]
+            current_content = [content_bytes]
             current_size = estimated_size
         # If adding this file would not exceed the limit, add to current batch
         else:
-            current_content.append(content)
+            current_content.append(content_bytes)
             current_size += estimated_size
 
     # Write out any remaining content in current batch
     if current_content:
         target_file_path = os.path.join(target_dir, f"combined_{file_counter}.txt")
-        with open(target_file_path, "w", encoding="utf-8") as target_file:
-            target_file.write(separator.join(current_content) + separator)
+        with open(target_file_path, "wb") as target_file:
+            target_file.write(separator_bytes.join(current_content) + separator_bytes)
     return file_counter
 
 if __name__ == "__main__":

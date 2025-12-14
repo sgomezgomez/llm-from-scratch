@@ -2,31 +2,17 @@
 # https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/03_bonus_pretraining_on_gutenberg/pretraining_simple.py
 
 # Standard library imports
-import argparse
-import datetime
-import hashlib
-import json
-import math
-import multiprocessing
-import os
-import platform
-import time
+import argparse, datetime, hashlib, json, math, multiprocessing, os, platform, subprocess, time, random, csv
 from pathlib import Path
 from typing import Literal, NoReturn
-
 # Third-party imports
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import tiktoken
+import matplotlib.pyplot as plt, numpy as np, torch, torch.nn as nn, torch.nn.functional as F, tiktoken
 from collections import OrderedDict
 from torch.utils.data import Dataset, DataLoader, RandomSampler
 from tqdm import tqdm
-
 # Custom imports
 from config.config import get_data_config
+from utils.paths import normalize_path, is_wsl
 from gpt import GPTModel
 
 def configure_dataloader_workers(user_specified: int | None = None, verbose: bool = True) -> int:
@@ -46,7 +32,8 @@ def configure_dataloader_workers(user_specified: int | None = None, verbose: boo
             num_workers = 0
         else:
             # Linux/macOS: fork is fast, use more workers
-            num_workers = min(4, max(4, cpu_count // 2))
+            #num_workers = min(4, max(4, cpu_count // 2))
+            num_workers = min(0, max(4, cpu_count // 2))
     
     # Configure multiprocessing for Windows if using workers
     if system == 'Windows' and num_workers > 0:
@@ -123,11 +110,14 @@ def get_gpu_stats(device: torch.device):
         utilization_pct = (allocated / total_memory) * 100 if total_memory > 0 else 0
         print(f"{'='*60}")
         print(
+            f"\n{'='*60}\n"
             f"  GPU Stats:\n"
+            f"{'='*60}\n"
             f"    Device:            {device}\n"
             f"    GPU allocated:     {allocated:.2f} GB ({utilization_pct:.1f}%)\n"
             f"    GPU reserved:      {reserved:.2f} GB\n"
-            f"    GPU peak:          {max_allocated:.2f} GB"
+            f"    GPU peak:          {max_allocated:.2f} GB\n"
+            f"{'='*60}\n"
         )
         print(f"{'='*60}")
 
@@ -138,7 +128,7 @@ def calculate_batch_loss(model,
     target_batch = target_batch.to(device, non_blocking=True)
     logits = model(input_batch)
     
-    # Create mask to ignore padded positions (don't compute loss for padding tokens)
+    # Mask to ignore padded positions (don't compute loss for padding tokens)
     mask = (target_batch != pad_token)
     
     # Flatten logits and targets
@@ -315,12 +305,23 @@ def save_checkpoint(model, checkpoint_dir: str, global_step: int = None, verbose
 
 def generate_sample(model, tokenizer, 
                     device: torch.device, 
-                    start_context: str, max_tokens: int):
+                    max_tokens: int):
     assert hasattr(model, 'generate') and callable(getattr(model, 'generate')), \
         "Model must have a 'generate' method"
     
+    prompts = [
+            "The capital of France is",
+            "The chemical symbol of gold is",
+            "If yesterday was Friday, then tomorrow will be",
+            "The opposite of hot is",
+            "The planets of the solar system are:",
+            "My favorite color is",
+            "If 5*x + 3 = 13, then x is",
+    ]
+    prompt = random.choice(prompts)
+    
     model.eval()
-    idx = torch.tensor([tokenizer.encode(start_context, allowed_special="all")], device=device)
+    idx = torch.tensor([tokenizer.encode(prompt, allowed_special="all")], device=device)
     
     # Collect all tokens from generator
     # Assumes generate uses streaming by default
@@ -337,24 +338,118 @@ def generate_sample(model, tokenizer,
     # Concatenate initial context with generated tokens
     all_tokens = torch.cat([idx] + generated_tokens, dim=1) if generated_tokens else idx
     text = tokenizer.decode(all_tokens.squeeze(0).tolist())
-    print(f"Generated text: {text.replace('\n', ' ')}")
+    print(
+        f"\n{'='*60}\n"
+        f"  Generated text:\n"
+        f"{'='*60}\n"
+        f"{text.replace('\n', ' ')}\n"
+        f"{'='*60}\n"
+    )
     model.train()
 
-def plot_loss(epochs: int, tokens: list[int],
-              train_losses: list[float], val_losses: list[float], 
+def plot_loss(global_step: int, step_losses: list[float],
+              eval_steps: list[int], eval_tokens: list[int],
+              eval_train_losses: list[float], eval_val_losses: list[float],
               save_path: str) -> None:
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(epochs, train_losses, label='Training Loss')
-    ax1.plot(epochs, val_losses, linestyle='-.', label='Validation Loss')
-    ax1.set(xlabel='Epochs', ylabel='Loss')
-    ax1.legend(loc='upper right')
-    ax1.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    ax2 = ax1.twiny() # Second x-axis with same y-axis
-    ax2.plot(tokens, train_losses, alpha=0, label='Tokens Seen')
-    ax2.set(xlabel='Tokens Seen')
+    """Plot per-step and per-eval losses with tokens on twin x-axis."""
+    fig, ax_loss = plt.subplots(figsize=(8, 5))
+
+    # Per-step training loss (primary x-axis: global step)
+    ax_loss.plot(range(1, len(step_losses) + 1), step_losses,
+                 color='tab:blue', alpha=0.5, label='Train Loss (step)')
+
+    # Per-eval losses (overlaid markers using actual eval steps)
+    # Train loss
+    ax_loss.plot(eval_steps, eval_train_losses, marker='o', linestyle='-',
+                 color='tab:green', label='Train Loss (eval)')
+    # Val loss
+    ax_loss.plot(eval_steps, eval_val_losses, marker='s', linestyle='-.',
+                 color='tab:red', label='Val Loss (eval)')
+
+    ax_loss.set(xlabel='Global Steps', ylabel='Loss')
+    ax_loss.legend(loc='upper right')
+    ax_loss.grid(True, alpha=0.2)
+
+    # Twin x-axis for tokens seen, aligned with steps
+    ax_tokens = ax_loss.twiny()
+    ax_tokens.set_xlim(ax_loss.get_xlim())
+    ticks = [tick for tick in ax_loss.get_xticks() if tick >= 1]
+    tick_indices = [min(int(tick) - 1, len(eval_tokens) - 1) for tick in ticks]
+    tick_labels = [format_tokens(eval_tokens[idx]) for idx in tick_indices]
+    ax_tokens.set_xticks(ticks)
+    ax_tokens.set_xticklabels(tick_labels)
+    ax_tokens.set_xlabel('Tokens Seen')
+
+    # Save plot
     fig.tight_layout()
-    plotname = save_path + "/loss_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".png"    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    plotname = f"{save_path}/loss_step_{global_step}_{timestamp}.png"
     plt.savefig(plotname)
+
+def append_csv_row(path: str, fieldnames: list[str], rows: list[dict]):
+    """Append rows to CSV, writing header if file is new."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    file_exists = os.path.exists(path)
+    with open(path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def log_steps(steps_dir: str,
+              epoch: int, global_step: int, tokens_seen: list[int],
+              losses: list[float], retrieval_times: list[float], 
+              compute_times: list[float], lr_values: list[float]) -> None:
+    """Write per-step rows since last eval."""
+    # Field names
+    step_fields = [
+        'timestamp', 'epoch', 'global_step', 'learning_rate',
+        'step_loss', 'retrieval_time', 'compute_time'
+    ]
+    # Rows
+    step_rows = []
+    start_step = global_step - len(losses) + 1
+    for idx in range(len(losses)):
+        step_idx = start_step + idx
+        step_rows.append({
+            'timestamp': datetime.datetime.now().isoformat(),
+            'epoch': epoch,
+            'global_step': step_idx,
+            'learning_rate': lr_values[idx],
+            'step_loss': losses[idx],
+            'retrieval_time': retrieval_times[idx],
+            'compute_time': compute_times[idx]
+        })
+    append_csv_row(os.path.join(steps_dir, 'step_metrics.csv'), step_fields, step_rows)
+
+def log_eval(steps_dir: str, epoch: int,
+             global_step: int, tokens_seen: int,
+             train_loss: float, val_loss: float,
+             lr_last: float, eval_time: float,
+             total_elapsed_s: float, eta_hms: str) -> None:
+    """Write one per-eval row."""
+    # Per-eval row
+    eval_fields = [
+        'timestamp', 'epoch', 'global_step', 'tokens_seen',
+        'train_loss', 'val_loss', 'lr_last',
+        'eval_time', 'total_elapsed_s', 'eta_hms'
+    ]
+
+    eval_row = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'epoch': epoch,
+        'global_step': global_step,
+        'tokens_seen': tokens_seen,
+        'train_loss': train_loss,
+        'val_loss': val_loss,
+        'lr_last': lr_last,
+        'eval_time': eval_time,
+        'total_elapsed_s': total_elapsed_s,
+        'eta_hms': eta_hms
+    }
+    append_csv_row(os.path.join(steps_dir, 'eval_metrics.csv'), eval_fields, [eval_row])
 
 class StreamingDataset(Dataset):
     """Dataset that reads files in chunks and tokenizes on-demand."""
@@ -365,7 +460,7 @@ class StreamingDataset(Dataset):
                  force_build: bool = False) -> None:
         # Discover files
         data_dirs = get_data_config().pretraining_data_dirs
-        self.file_paths = discover_files(data_dirs)
+        self.file_paths = [normalize_path(f) for f in discover_files(data_dirs)]
         assert len(self.file_paths) > 0, f"No training files found in directories: {data_dirs}."
         
         # Save dataset config params
@@ -397,9 +492,30 @@ class StreamingDataset(Dataset):
         self._max_cache_size = 100  # Number of files to cache per worker
         self._file_cache = OrderedDict()  # {file_idx: tokenized_numpy_array}
         self._file_mtimes = {}  # {file_idx: mtime} for cache validation
+        self._cached_raw_paths = {}  # {normalized_path: original_cached_path}
         
         # Build index mapping with per-file splits (with caching)
         self._build_index_map()
+
+    def _path_variants(self, path_str: str) -> list[str]:
+        """Return path variants to allow reusing caches across Windows/WSL."""
+        variants = [path_str]
+        if path_str in self._cached_raw_paths:
+            variants.append(self._cached_raw_paths[path_str])
+        if is_wsl():
+            try:
+                win_path = subprocess.check_output(["wslpath", "-w", path_str], text=True).strip()
+                variants.append(win_path)
+            except Exception:
+                pass
+        # Deduplicate preserving order
+        seen = set()
+        uniq = []
+        for p in variants:
+            if p not in seen:
+                uniq.append(p)
+                seen.add(p)
+        return uniq
     
     def _get_cache_key(self) -> str:
         config_str = json.dumps({
@@ -433,6 +549,11 @@ class StreamingDataset(Dataset):
         cache_key = hashlib.md5(f"{file_path}_{file_mtime}_{self.tokenizer_id}".encode()).hexdigest()
         # Use .npy for numpy
         return cache_dir / f"{cache_key}.npy"
+
+    def _iter_tokenized_cache_paths(self, file_path: str, file_mtime: float):
+        """Yield possible tokenized cache paths for different path variants (posix/windows)."""
+        for variant in self._path_variants(file_path):
+            yield self._get_tokenized_cache_path(variant, file_mtime)
     
     def _load_index_cache(self) -> dict:
         cache_path = self._get_index_cache_path()
@@ -445,15 +566,14 @@ class StreamingDataset(Dataset):
             json.dump(cache_data, f, indent=2)
     
     def _load_tokenized_cache(self, file_path: str, file_mtime: float) -> np.ndarray | None:
-        tokenized_cache_path = self._get_tokenized_cache_path(file_path, file_mtime)
-        if tokenized_cache_path.exists():
-            try:
-                # Load as numpy array directly
-                arr = np.load(tokenized_cache_path, allow_pickle=False)
-                return arr
-            except (IOError, ValueError, OSError):
-                # Cache corrupted or unreadable
-                return None
+        # Try multiple path variants (POSIX/Windows) to reuse caches built on different platforms
+        for tokenized_cache_path in self._iter_tokenized_cache_paths(file_path, file_mtime):
+            if tokenized_cache_path.exists():
+                try:
+                    arr = np.load(tokenized_cache_path, allow_pickle=False)
+                    return arr
+                except (IOError, ValueError, OSError):
+                    continue
         return None
     
     def _save_tokenized_cache(self, file_path: str, file_mtime: float, tokenized: list[int] | np.ndarray):
@@ -505,7 +625,12 @@ class StreamingDataset(Dataset):
                 
                 # Build lookup dict from cached file_sequences
                 for item in index_cache_data.get("file_sequences", []):
-                    cached_file_sequences[item["file_path"]] = item
+                    raw_path = item.get("file_path")
+                    normalized_path = normalize_path(raw_path)
+                    item["file_path"] = normalized_path
+                    cached_file_sequences[normalized_path] = item
+                    if raw_path:
+                        self._cached_raw_paths[normalized_path] = raw_path
         
         # Track which files need to be processed
         files_to_process = []
@@ -513,39 +638,55 @@ class StreamingDataset(Dataset):
         pbar = tqdm(self.file_paths, desc=f"Building {self.mode} dataset index", leave=False)
         
         for file_path in pbar:
-            file_path_str = str(file_path)
-            file_mtime = os.path.getmtime(file_path) if os.path.exists(file_path) else None
-            
+            file_path_str = normalize_path(str(file_path))
+            file_mtime_current = os.path.getmtime(file_path_str) if os.path.exists(file_path_str) else None
+
             # Check if file is in cache and mtime matches
             if file_path_str in cached_file_sequences:
                 cached_item = cached_file_sequences[file_path_str]
                 cached_mtime = cached_item.get("file_mtime")
                 
-                if cached_mtime == file_mtime:
+                if cached_mtime == file_mtime_current:
                     # Verify all required attributes are present
                     num_sequences = cached_item.get("num_sequences")
                     file_train_split_idx = cached_item.get("file_train_split_idx")
                     tokenized_length = cached_item.get("tokenized_length")
-                    
+
                     # If any required attribute is missing, process the file normally
                     if num_sequences is None or file_train_split_idx is None or tokenized_length is None:
-                        files_to_process.append((file_path_str, file_mtime))
+                        files_to_process.append((file_path_str, file_mtime_current))
                         continue
-                    
-                    # Verify the actual tokenized cache file exists on disk
-                    # Index cache might exist but tokenized file might be missing (e.g., manually deleted)
-                    tokenized_cache_path = self._get_tokenized_cache_path(file_path_str, file_mtime)
-                    if not tokenized_cache_path.exists():
+
+                    # Prefer cached mtime for locating tokenized cache; fall back to current
+                    mtime_candidates = [cached_mtime, file_mtime_current]
+                    file_mtime_use = None
+                    tokenized_exists = False
+                    for mtime in mtime_candidates:
+                        if mtime is None:
+                            continue
+                        if any(path.exists() for path in self._iter_tokenized_cache_paths(file_path_str, mtime)):
+                            tokenized_exists = True
+                            file_mtime_use = mtime
+                            break
+
+                    if not tokenized_exists:
                         # Tokenized cache file missing, need to recreate it
-                        files_to_process.append((file_path_str, file_mtime))
+                        files_to_process.append((file_path_str, file_mtime_current))
                         continue
-                    
+
                     # Use cached data, no need to read/tokenize
                     file_idx = len(self.file_sequences)
                     self.file_sequences.append((file_path_str, num_sequences, file_train_split_idx))
-                    
+                    # Store mtime used for this file to help downstream cache lookups
+                    if file_mtime_use is not None:
+                        self._file_mtimes[file_idx] = file_mtime_use
+
                     # Build sequences from cached metadata
                     self._build_sequences_for_file(file_idx, num_sequences, file_train_split_idx, tokenized_length)
+
+                    # Load to cache if max_cache_size not reached
+                    if len(self._file_cache) < self._max_cache_size:
+                        tokenized = self._get_tokenized_file(file_idx)
                     
                     cached_count += 1
                     pbar.set_postfix({
@@ -754,22 +895,24 @@ class StreamingDataLoader:
             persistent_workers=True if self.dataloader.num_workers > 0 else False
         )
 
-def train_model(model, tokenizer, optimizer: torch.optim.Optimizer, 
-                train_loader: StreamingDataLoader, 
-                val_loader: StreamingDataLoader, 
-                device: torch.device, 
+def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
+                train_loader: StreamingDataLoader,
+                val_loader: StreamingDataLoader,
+                device: torch.device,
                 num_epochs: int, eval_freq: int,
                 warmup_steps: int, initial_lr: float = 3e-5, min_lr: float = 1e-6,
                 grad_clip_norm: float = 1.0,
                 train_eval_batches: int = 10, val_eval_batches: int = 10,
-                start_context: str = "Hello, how are you?", 
-                save_path: str = None, # Directory to save checkpoints
+                save_path: str = get_data_config().model_dir + "/pretraining/", # Directory to save checkpoints
                 checkpoint_freq: int = 50000, # Frequency to save checkpoints
                 verbose: bool = False) -> tuple[list[float], list[float], list[int]]:
 
     # Initialize training metrics and step variables
-    train_losses, val_losses, track_tokens_seen, step_times, lr_values, eval_times = [], [], [], [], [], []
+    # Per step metrics
+    losses, retrieval_times, compute_times, lr_values = [], [], [], []
     tokens_seen, global_step = 0, -1
+    # Per eval round metrics
+    train_losses, val_losses, track_tokens_seen, eval_times, eval_steps = [], [], [], [], []
     
     # Print token statistics
     print_token_statistics(train_loader, val_loader)
@@ -781,14 +924,14 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats(device)
     
-    # Setup checkpoint directory if checkpointing is enabled
-    checkpoint_dir = None
-    if save_path is not None and checkpoint_freq > 0:
-        checkpoint_dir = get_data_config().model_dir + "/pretraining/" + save_path + "/checkpoints"
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        if verbose:
-            print(f"Checkpoints will be saved every {checkpoint_freq:,} steps to: {checkpoint_dir}")
-    
+    # Setup checkpoint, steps, and plot directories
+    dir_path = get_data_config().model_dir + "/pretraining/" + save_path
+    checkpoint_dir = dir_path + "/checkpoints" if checkpoint_freq > 0 else None
+    plot_dir = dir_path + "/plots"
+    steps_dir = dir_path + "/steps"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(plot_dir, exist_ok=True)
+    os.makedirs(steps_dir, exist_ok=True)   
     # Warmup steps and cosine decay (learning rate scheduler) parameters
     total_steps = num_epochs * len(train_loader) # Total number of training steps
     max_lr = optimizer.param_groups[0]['lr'] # Maximum learning rate
@@ -800,13 +943,12 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
     
     # Single progress bar tracking total steps
     pbar = tqdm(total=total_steps, desc="Training", unit="step")
-    data_retrieval_times = []
     data_start = time.perf_counter()
     
     # Iterate over epochs
     for epoch in range(num_epochs):
         # Iterate over dataloader batches
-        for input_batch, target_batch in train_loader.dataloader:            
+        for input_batch, target_batch in train_loader.dataloader:
             
             # Ensure batch from dataloader is moved to correct device
             if input_batch.device != device:
@@ -815,10 +957,10 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
             
             # Update batch retrieval times
             retrieval_time = time.perf_counter() - data_start
-            data_retrieval_times.append(retrieval_time)
+            retrieval_times.append(retrieval_time)
                 
             # Record step (forward + backward pass) start time
-            step_start_time = time.perf_counter()
+            compute_start_time = time.perf_counter()
             
             # Set model to training mode
             model.train()
@@ -852,19 +994,20 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
             loss.backward() # Compute gradients
             
             # Gradient clipping
-            if (global_step >= warmup_steps) and (grad_clip_norm > 0.0):
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+            if grad_clip_norm > 0.0:
+                clipped_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
 
             # Update parameters
             optimizer.step()
             
             # Update step (forward + backward pass) metrics
             tokens_seen += input_batch.numel()
-            step_duration = time.perf_counter() - step_start_time
-            step_times.append(step_duration)
+            step_compute_time = time.perf_counter() - compute_start_time
+            compute_times.append(step_compute_time)
             
             # Calculate metrics for progress bar
             current_loss = loss.item()
+            losses.append(current_loss)
             
             pbar.set_postfix({
                 'epoch': f'{epoch+1}/{num_epochs}',
@@ -879,16 +1022,12 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
                 print(f"Epoch {epoch+1} - Step {global_step:06d}:")
                 print(f"    Global step: {global_step:06d} of {total_steps:06d}")
                 print(f"    Batch retrieval time: {retrieval_time:.3f}s")
-                print(f"    Step (forward + backward pass) time: {step_duration:.3f}s")
-                print(f"    Total time: {retrieval_time + step_duration:.3f}s")
+                print(f"    Step (forward + backward pass) time: {step_compute_time:.3f}s")
+                print(f"    Total time: {retrieval_time + step_compute_time:.3f}s")
                 print(f"{'='*60}")
-
-            # Optional checkpoint saving
-            if checkpoint_freq > 0 and global_step > 0 and global_step % checkpoint_freq == 0:
-                save_checkpoint(model, checkpoint_dir, global_step=global_step, verbose=True)
             
             # Optional evaluation step (don't eval on step 0)
-            if global_step != 0 and global_step % eval_freq == 0:
+            if global_step % eval_freq == 0:
                 eval_start_time = time.perf_counter()
                 train_loss, val_loss = evaluate_model(
                     model=model,
@@ -903,13 +1042,14 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens_seen.append(tokens_seen)
+                eval_steps.append(global_step)
                 eval_duration = time.perf_counter() - eval_start_time
                 eval_times.append(eval_duration)
-                
+
                 # Timing metrics
-                avg_step_time = sum(step_times) / len(step_times)
+                avg_step_time = sum(compute_times) / len(compute_times)
                 avg_eval_time = sum(eval_times) / len(eval_times)
-                last_step_time = step_times[-1]
+                last_step_time = compute_times[-1]
                 total_elapsed_time = time.perf_counter() - start_time
                 est_time_remaining = avg_step_time * (total_steps - global_step)
                 est_time_remaining += avg_eval_time * ((total_steps - global_step) / eval_freq)
@@ -917,7 +1057,9 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
                 eta_h, eta_m, eta_s = convert_time(eta)
                 
                 print(
-                    f"Epoch {epoch+1} - Step {global_step:06d}:\n"
+                    f"\n{'='*60}\n"
+                    f"Training metrics: Epoch {epoch+1} - Step {global_step:06d}:\n"
+                    f"{'='*60}\n"
                     f"    Global step:       {global_step:06d} of {total_steps:06d}\n"
                     f"    Train loss:        {train_loss:.3f} ({train_eval_batches} batches)\n"
                     f"    Val loss:          {val_loss:.3f} ({val_eval_batches} batches)\n"
@@ -926,43 +1068,79 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
                     f"    Avg step time:     {avg_step_time:.3f}s\n"
                     f"    Avg eval time:     {avg_eval_time:.3f}s\n"
                     f"    Total elapsed:     {total_elapsed_time:.1f}s\n"
-                    f"    ETA to completion: {eta_h}h {eta_m}m {eta_s}s"
+                    f"    ETA to completion: {eta_h}h {eta_m}m {eta_s}s\n"
+                    f"{'='*60}\n"
                 )
-                
+
                 # Print GPU stats if available (verbose only)
-                if verbose and device.type == 'cuda':
+                if device.type == 'cuda':
                     get_gpu_stats(device)
-                
+
                 # Generate sample text
                 generate_sample(
                     model=model,
                     tokenizer=tokenizer,
                     device=device,
-                    start_context=start_context,
                     max_tokens=50
                 )
-                
+
+                # Log per-step metrics
+                log_steps(
+                    steps_dir=steps_dir,
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    tokens_seen=track_tokens_seen[-eval_freq:],
+                    losses=losses[-eval_freq:],
+                    retrieval_times=retrieval_times[-eval_freq:],
+                    compute_times=compute_times[-eval_freq:],
+                    lr_values=lr_values[-eval_freq:],
+                )
+                # Log per-eval metrics
+                log_eval(
+                    steps_dir=steps_dir,
+                    epoch=epoch + 1,
+                    global_step=global_step,
+                    tokens_seen=tokens_seen,
+                    train_loss=train_loss,
+                    val_loss=val_loss,
+                    lr_last=lr,
+                    eval_time=eval_duration,
+                    total_elapsed_s=total_elapsed_time,
+                    eta_hms=f"{eta_h}h{eta_m}m{eta_s}s",
+                )
+            
+            # Optional checkpoint saving
+            if checkpoint_freq > 0 and global_step > 0 and global_step % checkpoint_freq == 0:
+                # Model checkpoint
+                save_checkpoint(
+                    model=model, 
+                    checkpoint_dir=checkpoint_dir, 
+                    global_step=global_step, 
+                    verbose=True
+                )
+
+                # Plot loss up to current step
+                plot_loss(
+                    global_step=global_step,
+                    step_losses=losses,
+                    eval_steps=eval_steps,
+                    eval_tokens=track_tokens_seen,
+                    eval_train_losses=train_losses,
+                    eval_val_losses=val_losses,
+                    save_path=plot_dir,
+                )
+
             # Start timing for next batch retrieval (for troubleshooting)
             # This measures the gap between steps which includes batch retrieval time
             data_start = time.perf_counter()
     
-    pbar.close()  # Close progress bar after training
-        
-    # Plot loss
-    plot_loss(
-        epochs=torch.linspace(1, num_epochs, len(train_losses)),
-        tokens=track_tokens_seen,
-        train_losses=train_losses,
-        val_losses=val_losses,
-        save_path=get_data_config().plot_dir
-    )
+    pbar.close()  # Close progress bar after training    
 
     # Save final model checkpoint
-    if save_path is not None:
-        dir_path = get_data_config().model_dir + "/pretraining/" + save_path
-        save_checkpoint(model, dir_path, verbose=True)
+    save_checkpoint(model, checkpoint_dir, verbose=True)
     
     # Evaluate model on final step
+    eval_start_time = time.perf_counter()
     final_train_loss, final_val_loss = evaluate_model(
             model=model,
             train_loader=train_loader,
@@ -971,6 +1149,50 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
             pad_token=pad_token,
             train_eval_batches=train_eval_batches,
             val_eval_batches=val_eval_batches
+    )
+    train_losses.append(final_train_loss)
+    val_losses.append(final_val_loss)
+    track_tokens_seen.append(tokens_seen)
+    eval_steps.append(global_step)
+    eval_duration = time.perf_counter() - eval_start_time
+    eval_times.append(eval_duration)
+
+    # Final loss plot
+    plot_loss(
+        global_step=global_step,
+        step_losses=losses,
+        eval_steps=eval_steps,
+        eval_tokens=track_tokens_seen,
+        eval_train_losses=train_losses,
+        eval_val_losses=val_losses,
+        save_path=plot_dir,
+    )
+
+    # Final step metrics
+    steps_since_last_eval = global_step - eval_steps[-1] if len(eval_steps) > 0 else global_step + 1
+    steps_to_slice = min(steps_since_last_eval, len(losses))
+    log_steps(
+        steps_dir=steps_dir,
+        epoch=num_epochs,
+        global_step=global_step,
+        tokens_seen=track_tokens_seen[-steps_to_slice:],
+        losses=losses[-steps_to_slice:],
+        retrieval_times=retrieval_times[-steps_to_slice:],
+        compute_times=compute_times[-steps_to_slice:],
+        lr_values=lr_values[-steps_to_slice:],
+    )
+    # Final eval metrics
+    log_eval(
+        steps_dir=steps_dir,
+        epoch=epoch + 1,
+        global_step=global_step,
+        tokens_seen=tokens_seen,
+        train_loss=final_train_loss,
+        val_loss=final_val_loss,
+        lr_last=lr,
+        eval_time=eval_duration,
+        total_elapsed_s=total_elapsed_time,
+        eta_hms=f"{eta_h}h{eta_m}m{eta_s}s",
     )
     
     # Print final training summary
@@ -983,8 +1205,7 @@ def train_model(model, tokenizer, optimizer: torch.optim.Optimizer,
     print(f"Final val loss: {final_val_loss:.3f}")
     print(f"{'='*60}\n")
 
-    return train_losses, val_losses, track_tokens_seen
-
+    return losses, train_losses, val_losses, track_tokens_seen
 
 if __name__ == "__main__":
 
@@ -1005,7 +1226,7 @@ if __name__ == "__main__":
                         help="Batch size for training")
     parser.add_argument("--num_workers", type=int, default=None,
                         help="Number of DataLoader workers (None=auto: 0 for Windows, 2-4 for Linux)")
-    parser.add_argument("--checkpoint_freq", type=int, default=50000,
+    parser.add_argument("--checkpoint_freq", type=int, default=25000,
                         help="Frequency of checkpoint saves (in steps). Set to 0 to disable checkpoints.")
     parser.add_argument("--verbose", action="store_true", default=False,
                         help="Enable verbose output (detailed timing, batch info, GPU stats, generated samples)")
@@ -1093,7 +1314,7 @@ if __name__ == "__main__":
     )
     
     # Train model (verbose logging already in the train_model function)
-    train_losses, val_losses, tokens_seen = train_model(
+    losses, train_losses, val_losses, tokens_seen = train_model(
         model=model,
         tokenizer=tokenizer,
         optimizer=optimizer,
@@ -1106,10 +1327,9 @@ if __name__ == "__main__":
         initial_lr=args.initial_lr,
         min_lr=args.min_lr,
         grad_clip_norm=1.0,
-        train_eval_batches=5,
-        val_eval_batches=5,
-        start_context="The planets of the solar system are: ",
-        save_path="test",
+        train_eval_batches=150,
+        val_eval_batches=150,
+        save_path="gpt2-small",
         checkpoint_freq=args.checkpoint_freq,
         verbose=args.verbose
     )

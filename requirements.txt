@@ -2,11 +2,22 @@
 #   1. Install PyTorch separately (see below)
 #   2. Run: pip install -r requirements.txt
 #
-# Python 3.11.13 (current - installed separately)
-# PyTorch - Install separately based on your needs:
-#   GPU (CUDA): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-#   CPU only:   pip install torch torchvision torchaudio
-#   See https://pytorch.org/get-started/locally/ for details
+# Installation using WSL (Ubuntu):
+#   1. Install Python (maybe latest version)
+#   2. Go to repo. Run: cd /mnt/c/Users/sgome/repos/llm-from-scratch
+#   3. Activate venv. Run:
+#        sudo apt update
+#        sudo apt install -y python3-venv
+#        # Create virtual environment in repo
+#        python3 -m venv .venv
+#        # Activate it (this is what makes pip installs safe)
+#        source .venv/bin/activate
+#   4. Install requirements
+#       # Install requirements inside venv
+#       python -m pip install --upgrade pip
+#       python -m pip install -r requirements.txt
+#   5. Install PyTorch separately (see below)
+#      pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 python-dotenv
 numpy
 tiktoken
@@ -15,3 +26,6 @@ transformers
 thop
 tqdm
 langdetect
+sentencepiece
+huggingface_hub
+blobfile

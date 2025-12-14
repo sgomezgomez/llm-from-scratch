@@ -1,41 +1,60 @@
 import torch, torch.nn as nn, torch.nn.functional as F
-# Switched to KV cached multi head attention
-# from attention import MultiHeadAttention_ScaledDotProduct
+import sentencepiece as spm
+from huggingface_hub import login, hf_hub_download
+from config.config import access_config
+from typing import List
 
-class GPTModel(nn.Module):
+class Llama2Model(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
-        self.token_emb = nn.Embedding(self.cfg["vocab_size"], self.cfg["embed_dim"])
-        self.pos_emb = nn.Embedding(self.cfg["context_len"], self.cfg["embed_dim"])
-        self.drop_emb = nn.Dropout(self.cfg["drop_emb_rate"])
-        # Switched to KV cached multi head attention
-        #self.transformer_blocks = nn.Sequential(*[TransformerBlock(self.cfg) for _ in range(self.cfg["num_layers"])])
-        self.transformer_blocks = nn.ModuleList([TransformerBlock(self.cfg) for _ in range(self.cfg["num_layers"])])
-        self.final_norm = LayerNorm(self.cfg["embed_dim"])
-        self.out_head = nn.Linear(self.cfg["embed_dim"], self.cfg["vocab_size"], bias=False)
-
+        self.token_emb = nn.Embedding(self.cfg["vocab_size"], self.cfg["embed_dim"], dtype=self.cfg["dtype"])
+        # No need for positional or dropout embedding for Llama 2
+        self.transformer_blocks = nn.Sequential(*[TransformerBlock(self.cfg) for _ in range(self.cfg["num_layers"])])
+        self.final_norm = RMSNorm(self.cfg["embed_dim"], dtype=self.cfg["dtype"])
+        self.out_head = nn.Linear(self.cfg["embed_dim"], self.cfg["vocab_size"], dtype=self.cfg["dtype"], bias=False)
         # KV cache current position pointer
         self.ptr_current_position = 0
+        # Precompute Rotary Positional Embedding (RoPE) for faster inference
+        # At model level to avoid recomputing for each attention head
+        cos, sin = self.precompute_rope()
+        self.register_buffer("cos", cos)
+        self.register_buffer("sin", sin)
+    
+    def precompute_rope(self, theta_base=10_000):
+        # Compute inverse frequencies
+        # Shape: (head_dim//2,)
+        head_dim = self.cfg["embed_dim"] // self.cfg["num_heads"]
+        inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=self.cfg["dtype"], device=self.get_device())[:(head_dim//2)] / head_dim))
+        # Generate position indices
+        # Shape: (context_len,)
+        pos = torch.arange(self.cfg["context_len"], dtype=self.cfg["dtype"], device=self.get_device())
+        # Compute angles
+        # (context_len, 1) * (1, head_dim//2) -> (context_len, head_dim//2)
+        angles = pos.unsqueeze(1) * inv_freq.unsqueeze(0) 
+        # Expand angles to match head_dim
+        angles = torch.cat([angles, angles], dim=1) # (context_len, head_dim)
+        # Precompute cosine and sine
+        cos, sin = torch.cos(angles), torch.sin(angles) # (context_len, head_dim) -- each
+
+        return cos, sin
     
     def forward(self, x: torch.Tensor, kv_cache: bool = None) -> torch.Tensor:
         batch_size, seq_len = x.shape
         token_emb = self.token_emb(x)
-        # Switched to KV cached multi head attention
-        # pos_emb = self.pos_emb(torch.arange(seq_len, device=x.device)) # device setting allos us to train model on GPT or CPU
-        if kv_cache:
-            pos_ids = torch.arange(self.ptr_current_position, (self.ptr_current_position + seq_len), device=x.device, dtype=torch.long)
-            self.ptr_current_position += seq_len
-        else:
-            pos_ids = torch.arange(0, seq_len, device=x.device, dtype=torch.long)
-        pos_emb = self.pos_emb(pos_ids).unsqueeze(0)
+        # No positional embedding for llama 2
 
-        x = token_emb + pos_emb
-        x = self.drop_emb(x)
+        # Switched to KV cached multi head attention
+        if kv_cache:
+            self.ptr_current_position += seq_len
+
+        x = token_emb
         # Switched to KV cached multi head attention
         # x = self.transformer_blocks(x)
         for block in self.transformer_blocks:
-            x = block(x, kv_cache=kv_cache) # KV cached multi head attention
+            # KV cached multi head attention with RoPE
+            # Adjust cos and sin shapes to match the sequence length (seq_len)
+            x = block(x, self.cos[:seq_len, :], self.sin[:seq_len, :], kv_cache=kv_cache) 
         x = self.final_norm(x)
         logits = self.out_head(x)
         return logits
@@ -124,7 +143,6 @@ class GPTModel(nn.Module):
                 
                 # Sample from probabilities
                 idx_next = torch.multinomial(probs, num_samples=1)
-
             
             # Append new token to sequence
             idx = torch.cat((idx, idx_next), dim=1)
@@ -152,28 +170,27 @@ class TransformerBlock(nn.Module):
             d_out=cfg["embed_dim"],
             context_len=cfg["context_len"],
             num_heads=cfg["num_heads"],
-            dropout=cfg["drop_attn_rate"],
-            bias=cfg["qkv_bias"],
+            dtype=cfg["dtype"],
             # KV cache parameters
-            window_size=cfg["kv_window_size"] if "kv_window_size" in cfg else cfg["context_len"]
+            max_seq_len=cfg["max_seq_len"] if "max_seq_len" in cfg else None,
+            window_size=cfg["window_size"] if "window_size" in cfg else None
         )
         self.ffn = FeedForward(cfg)
-        self.norm1 = LayerNorm(cfg["embed_dim"])
-        self.norm2 = LayerNorm(cfg["embed_dim"])
-        self.drop_attn_shortcut = nn.Dropout(cfg["drop_attn_rate"])
-        self.drop_ffn_shortcut = nn.Dropout(cfg["drop_ffn_rate"])
+        self.norm1 = RMSNorm(cfg["embed_dim"], dtype=cfg["dtype"])
+        self.norm2 = RMSNorm(cfg["embed_dim"], dtype=cfg["dtype"])
+        # No shortcut (residual connection) dropout for Llama 2
     
-    def forward(self, x, kv_cache: bool = False):
+    def forward(self, x, cos, sin, kv_cache: bool = False):
         shortcut = x
         x = self.norm1(x)
-        x = self.attention(x, kv_cache=kv_cache) # KV cached multi head attention
-        x = self.drop_attn_shortcut(x)
+        x = self.attention(x, cos, sin, kv_cache=kv_cache) # KV cached multi head attention
+        # No shortcut (residual connection) dropout for Llama 2
         x = x + shortcut # Residual connection
         
         shortcut = x
         x = self.norm2(x)
         x = self.ffn(x)
-        x = self.drop_ffn_shortcut(x)
+        # No shortcut (residual connection) dropout for Llama 2
         x = x + shortcut # Residual connection
         return x
 
@@ -183,30 +200,52 @@ class TransformerBlock(nn.Module):
 # Also adapted from: https://github.com/karpathy/nanochat/blob/a83646e098374de4d4f2c2da1175d2f5fdd18ed3/nanochat/gpt.py
 class MultiHeadAttention_KVCache(nn.Module):
     def __init__(self, 
-                 d_in: int, 
-                 d_out: int, 
-                 context_len: int, 
-                 dropout: float, 
+                 d_in: int, # Embedding dimension
+                 d_out: int, # Hidden dimension
+                 context_len: int,
+                 # No dropout for llama 2 
                  num_heads: int, 
-                 bias: bool = False, 
+                 dtype: torch.dtype, 
                  max_seq_len: int = None, 
                  window_size: int = None):
         super().__init__()
         assert d_out % num_heads == 0, "d_out must be divisible by num_heads"
-        self.d_out = d_out
+        self.d_in = d_in # Embedding dimension
+        self.d_out = d_out # Hidden dimension
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads # Reduce projection dim to match desired output dim
+        self.context_len = context_len
+        self.dtype = dtype # Store dtype for cache initialization
         # Combine queries, keys, and values into a single linear layer
-        self.qkv = nn.Linear(d_in, 3 * d_out, bias=bias)
-        self.proj = nn.Linear(d_out, d_out) # Linear projection to combine head outputs
-        self.dropout = dropout
+        self.qkv = nn.Linear(d_in, 3 * d_out, bias=False, dtype=dtype)
+        self.proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype) # Linear projection to combine head outputs
+        # No dropout for llama 2
         # KV cache buffers
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
         self.max_seq_len = max_seq_len or context_len
-        self.window_size = window_size or max_seq_len # Sliding window size for KV caching
+        self.window_size = window_size or self.max_seq_len # Sliding window size for KV caching
     
-    def forward(self, x: torch.Tensor, kv_cache: bool = False) -> torch.Tensor:
+    def apply_rope(self, x, cos, sin):
+        # x corresponds to the projected queries and keys
+        batch, num_heads, num_tokens, head_dim = x.shape
+        assert cos.shape == (num_tokens, self.head_dim), "cos and sin shape must match the sequence length"
+        assert sin.shape == cos.shape, "cos and sin must have the same shape"
+        # Split x into halves
+        x1 = x[..., :head_dim//2] # First half -> (batch, num_heads, num_tokens, head_dim//2
+        x2 = x[..., head_dim//2:] # Second half -> (batch, num_heads, num_tokens, head_dim//2)
+        # Adjust cos and sin shapes
+        cos = cos.unsqueeze(0).unsqueeze(0) # (num_tokens, head_dim) -> (1, 1, num_tokens, head_dim)
+        sin = sin.unsqueeze(0).unsqueeze(0) # (num_tokens, head_dim) -> (1, 1, num_tokens, head_dim)
+        # Apply rotary transformation
+        # This simulates multiplying by [0 -1; 1 0] rotation matrix
+        rotated = torch.cat((-x2, x1), dim=-1) # (batch, num_heads, num_tokens, head_dim)
+        # Apply formula
+        x_rotated = (x * cos) + (rotated * sin) # (batch, num_heads, num_tokens, head_dim)
+
+        return x_rotated.to(dtype=x.dtype)
+    
+    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, kv_cache: bool = False) -> torch.Tensor:
         batch, num_tokens, d_in = x.shape
         # Project input into queries, keys, and values --> (batch, num_tokens, 3 * d_in)
         qkv = self.qkv(x)
@@ -214,11 +253,18 @@ class MultiHeadAttention_KVCache(nn.Module):
         # This means num_tokens == Tq == 1 in those cases
         qkv = qkv.view(batch, num_tokens, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # (3, batch, num_heads, num_tokens, head_dim)
         q, k_new, v_new = qkv # 3 times (batch, num_heads, num_tokens, head_dim)
+        # Apply RoPE -- QK rotary embedding
+        q = self.apply_rope(q, cos, sin) # (batch, num_heads, num_tokens, head_dim)
+        k_new = self.apply_rope(k_new, cos, sin) # (batch, num_heads, num_tokens, head_dim)
 
         if kv_cache:
             # Initialize cache as zeros tensors
             if self.cache_k is None or self.cache_k.size(0) != batch:
-                self.cache_k = torch.zeros(batch, self.num_heads, self.window_size, self.head_dim, device=x.device)
+                self.cache_k = torch.zeros(
+                    batch, self.num_heads, self.window_size, self.head_dim, 
+                    device=x.device, 
+                    dtype=self.dtype
+                )
                 self.cache_v = torch.zeros_like(self.cache_k)
                 self.ptr_current_position = 0 # # Pointer to the next free position in the cache
             # If incoming tokens exceed window size, shift cache left
@@ -246,8 +292,8 @@ class MultiHeadAttention_KVCache(nn.Module):
         if kv_cache is None or not kv_cache or (Tk == Tq):
             context_vec = F.scaled_dot_product_attention(
                 q, k, v,
-                is_causal=True,
-                dropout_p=(self.dropout if self.training else 0.0)
+                is_causal=True
+                # No dropout for llama 2
             )
         # Only one token in current batch -- No causal mask or dropout
         # (During inference, with kv cache after first pass)
@@ -256,8 +302,7 @@ class MultiHeadAttention_KVCache(nn.Module):
         elif Tq == 1:
             context_vec = F.scaled_dot_product_attention(
                 q, k, v,
-                is_causal=False,
-                dropout_p=0.0
+                is_causal=False
             )
         # (During batched inference with KV cache)
         else:
@@ -270,8 +315,7 @@ class MultiHeadAttention_KVCache(nn.Module):
             attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
             context_vec = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=0.0
+                attn_mask=attn_mask
             )
 
         # Combine heads
@@ -282,51 +326,87 @@ class MultiHeadAttention_KVCache(nn.Module):
     def reset_kv_cache(self):
         self.cache_k, self.cache_v = None, None
 
-class LayerNorm(nn.Module):
-    def __init__(self, embed_dim):
+# RMSNorm instead of LayerNorm
+class RMSNorm(nn.Module):
+    def __init__(self, embed_dim, eps=1e-5, dtype=None):
         super().__init__()
-        self.eps = 1e-5
-        self.scale = nn.Parameter(torch.ones(embed_dim)) # Gamma
-        self.shift = nn.Parameter(torch.zeros(embed_dim)) # Beta
+        # Option 1: pytorch native RMSNorm
+        self.rmsnorm = torch.nn.RMSNorm(normalized_shape=embed_dim, eps=eps, dtype=dtype)
+
+        # Option 2: custom RMSNorm
+        # self.eps = eps
+        # self.embed_dim = embed_dim
+        # self.weight = nn.Parameter(torch.ones(embed_dim, dtype=dtype))
     
     def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        norm_x = (x - mean) / torch.sqrt(var + self.eps)
-        return self.scale * norm_x + self.shift
-
-class GELU(nn.Module):
+        # Option 1: pytorch native RMSNorm
+        return self.rmsnorm(x)
+        # Option 2: custom RMSNorm
+        # Cast to float32 for stability
+        # x_fp32 = x.float() 
+        # means = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        # rsqrt effectively replaces 1/sqrt
+        # x_normed = x_fp32 * torch.rsqrt(means + self.eps)
+        # Cast back to original dtype
+        # return (x_normed * self.weight).to(dtype=x.dtype)
+  
+# SiLU instead of GELU activation
+# Represents the custom SiLU implementation
+# Note: This is not used in the Llama2 model, but is included for completeness
+class SiLU(nn.Module):
     def __init__(self):
-        super().__init__()
+        super(SiLU, self).__init__()
     
     def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(torch.sqrt(torch.tensor(2 / torch.pi)) * (x + 0.04475 * torch.pow(x, 3))))
+        return x * torch.sigmoid(x)
 
+# Llama uses a Gates Linear nit (GLU) variat of silu called SwiGLU
+# This results in a different structure for the feedforward layer
 class FeedForward(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(cfg["embed_dim"], 4 * cfg["embed_dim"]),
-            GELU(),
-            nn.Linear(4 * cfg["embed_dim"], cfg["embed_dim"]),
-        )
+        self.fc1 = nn.Linear(cfg["embed_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        self.fc2 = nn.Linear(cfg["embed_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["embed_dim"], dtype=cfg["dtype"], bias=False)
+        # We created a custom SiLU class for demo purposes, but we'll use the native PyTorch SiLU
     
     def forward(self, x):
-        return self.layers(x)
+        x_fc1 = self.fc1(x)
+        x_fc2 = self.fc2(x)
+        x = F.silu(x_fc1) * x_fc2 # PyTorch native SiLU
+        return self.fc3(x)
+
+class Llama2Tokenizer:
+    def __init__(self, model_name: str = "Llama-2-7b-hf"):
+        access_token = access_config.huggingface_api_key
+        login(access_token)
+        tokenizer_file = hf_hub_download(
+            repo_id="meta-llama/" + model_name,
+            filename="tokenizer.model",
+            local_dir=model_name
+        )
+        sp = spm.SentencePieceProcessor()
+        sp.Load(tokenizer_file)
+        self.tokenizer = sp
+    
+    def encode(self, text: str) -> List[int]:
+        return self.tokenizer.encode(text)
+    
+    def decode(self, ids: List[int]) -> str:
+        return self.tokenizer.decode(ids)
 
 if __name__ == "__main__":
     cfg = {
-        "vocab_size": 50257,
-        "context_len": 1024,
-        "embed_dim": 768,
-        "num_heads": 12,
-        "num_layers": 12,
-        "qkv_bias": False,
-        "drop_emb_rate": 0.1,
-        "drop_ffn_rate": 0.1,
-        "drop_attn_rate": 0.1,
+        "vocab_size": 32000,
+        "context_len": 4096,
+        "embed_dim": 4096,
+        "hidden_dim": 11008,
+        "num_heads": 32,
+        "num_layers": 32,
+        "dtype": torch.float16,
     }
-    model = GPTModel(cfg)
+    tokenizer = Llama2Tokenizer()
+    model = Llama2Model(cfg)
     total_params = sum(p.numel() for p in model.parameters())
     total_params_mb = total_params * 4 / 1024 / 1024
     total_params_feedforward = sum(p.numel() for block in model.transformer_blocks for p in block.ffn.parameters())
@@ -334,7 +414,7 @@ if __name__ == "__main__":
     print(f"Total model parameters: {total_params}")
     print(f"Feedforward parameters: {total_params_feedforward}")
     print(f"Attention parameters: {total_params_attention}")
-    print(f"Model size: {total_params_mb / 1024:.2f} GB")
+    print(f"Model size: {total_params_mb:.2f} MB")
     print(f"Token embedding shape: {model.token_emb.weight.shape}")
     print(f"Ouput layer shape: {model.out_head.weight.shape}")
     
@@ -346,9 +426,7 @@ if __name__ == "__main__":
         logits = model(x)
         print(f"Sequence length {seq_len:4d}: Input shape {x.shape} -> Output shape {logits.shape}")
 
-    import tiktoken
-    tokenizer = tiktoken.get_encoding("gpt2")
     text = "Hello, how are you?"
-    input_ids = torch.tensor([tokenizer.encode(text, allowed_special="all")], dtype=torch.long) # Convert list to tensor and add batch dimension
+    input_ids = torch.tensor([tokenizer.encode(text)], dtype=torch.long) # Convert list to tensor and add batch dimension
     output = model.generate_simple(input_ids, 10)
     print(tokenizer.decode(output.squeeze(0).tolist()))
